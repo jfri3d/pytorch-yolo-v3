@@ -5,12 +5,12 @@ import torch.nn as nn
 from torch.autograd import Variable
 import numpy as np
 import cv2 
-from util import *
+from .util import *
 import argparse
 import os 
 import os.path as osp
-from darknet import Darknet
-from preprocess import prep_image, inp_to_image
+from .darknet import Darknet
+from .preprocess import prep_image, inp_to_image
 import pandas as pd
 import random 
 import pickle as pkl
@@ -29,8 +29,8 @@ class test_net(nn.Module):
         fwd = nn.Sequential(self.linear_1, *self.middle, self.output)
         return fwd(x)
         
-def get_test_input(input_dim, CUDA):
-    img = cv2.imread("dog-cycle-car.png")
+def get_test_input(fname, input_dim, CUDA):
+    img = cv2.imread(fname)
     img = cv2.resize(img, (input_dim, input_dim)) 
     img_ =  img[:,:,::-1].transpose((2,0,1))
     img_ = img_[np.newaxis,:,:,:]/255.0
@@ -65,9 +65,15 @@ def arg_parse():
     parser.add_argument("--cfg", dest = 'cfgfile', help = 
                         "Config file",
                         default = "cfg/yolov3.cfg", type = str)
+    parser.add_argument("--names", dest = 'names', help =
+                        "coco names file",
+                        default = "data/coco.names", type = str)
     parser.add_argument("--weights", dest = 'weightsfile', help = 
                         "weightsfile",
                         default = "yolov3.weights", type = str)
+    parser.add_argument("--test_im", dest = 'test_im', help =
+                        "test_im",
+                        default = "dog-cycle-car.png", type = str)
     parser.add_argument("--reso", dest = 'reso', help = 
                         "Input resolution of the network. Increase to increase accuracy. Decrease to increase speed",
                         default = "416", type = str)
@@ -110,7 +116,7 @@ if __name__ ==  '__main__':
     CUDA = torch.cuda.is_available()
 
     num_classes = 80
-    classes = load_classes('data/coco.names') 
+    classes = load_classes(args.names)
 
     #Set up the neural network
     print("Loading network.....")
@@ -174,7 +180,7 @@ if __name__ ==  '__main__':
     
 
     write = False
-    model(get_test_input(inp_dim, CUDA), CUDA)
+    model(get_test_input(args.test_im, inp_dim, CUDA), CUDA)
     
     start_det_loop = time.time()
     
@@ -276,30 +282,30 @@ if __name__ ==  '__main__':
     
     class_load = time.time()
 
-    colors = pkl.load(open("pallete", "rb"))
+    # colors = pkl.load(open("pallete", "rb"))
     
     
     draw = time.time()
 
 
-    def write(x, batches, results):
+    def write(x, results):
         c1 = tuple(x[1:3].int())
         c2 = tuple(x[3:5].int())
         img = results[int(x[0])]
         cls = int(x[-1])
         label = "{0}".format(classes[cls])
-        color = random.choice(colors)
-        cv2.rectangle(img, c1, c2,color, 1)
-        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1 , 1)[0]
+        # color = random.choice(colors)
+        cv2.rectangle(img, c1, c2, [255, 0, 0], 10)
+        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 5 , 5)[0]
         c2 = c1[0] + t_size[0] + 3, c1[1] + t_size[1] + 4
-        cv2.rectangle(img, c1, c2,color, -1)
-        cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 1, [225,255,255], 1)
+        cv2.rectangle(img, c1, c2, [255, 0, 0], -1)
+        cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 5, [225,255,255], 5)
         return img
     
             
-    list(map(lambda x: write(x, im_batches, orig_ims), output))
+    list(map(lambda x: write(x, orig_ims), output))
       
-    det_names = pd.Series(imlist).apply(lambda x: "{}/det_{}".format(args.det,x.split("/")[-1]))
+    det_names = pd.Series(imlist).apply(lambda x: "{}/{}".format(args.det,x.split("/")[-1]))
     
     list(map(cv2.imwrite, det_names, orig_ims))
     
