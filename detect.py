@@ -1,334 +1,238 @@
 from __future__ import division
-import time
-import torch 
-import torch.nn as nn
-from torch.autograd import Variable
+
+import os
+
+import click
+import cv2
+import geopandas as gpd
 import numpy as np
-import cv2 
-from .util import *
-import argparse
-import os 
-import os.path as osp
+import torch
 from .darknet import Darknet
-from .preprocess import prep_image, inp_to_image
-import pandas as pd
-import random 
-import pickle as pkl
-import itertools
-
-class test_net(nn.Module):
-    def __init__(self, num_layers, input_size):
-        super(test_net, self).__init__()
-        self.num_layers= num_layers
-        self.linear_1 = nn.Linear(input_size, 5)
-        self.middle = nn.ModuleList([nn.Linear(5,5) for x in range(num_layers)])
-        self.output = nn.Linear(5,2)
-    
-    def forward(self, x):
-        x = x.view(-1)
-        fwd = nn.Sequential(self.linear_1, *self.middle, self.output)
-        return fwd(x)
-        
-def get_test_input(fname, input_dim, CUDA):
-    img = cv2.imread(fname)
-    img = cv2.resize(img, (input_dim, input_dim)) 
-    img_ =  img[:,:,::-1].transpose((2,0,1))
-    img_ = img_[np.newaxis,:,:,:]/255.0
-    img_ = torch.from_numpy(img_).float()
-    img_ = Variable(img_)
-    
-    if CUDA:
-        img_ = img_.cuda()
-    num_classes
-    return img_
+from shapely.geometry import box
+from torch.autograd import Variable
+from .util import write_results
 
 
-
-def arg_parse():
+def load_classes(namesfile):
     """
-    Parse arguements to the detect module
-    
+
+    Args:
+        namesfile:
+
+    Returns:
+
     """
-    
-    
-    parser = argparse.ArgumentParser(description='YOLO v3 Detection Module')
-   
-    parser.add_argument("--images", dest = 'images', help = 
-                        "Image / Directory containing images to perform detection upon",
-                        default = "imgs", type = str)
-    parser.add_argument("--det", dest = 'det', help = 
-                        "Image / Directory to store detections to",
-                        default = "det", type = str)
-    parser.add_argument("--bs", dest = "bs", help = "Batch size", default = 1)
-    parser.add_argument("--confidence", dest = "confidence", help = "Object Confidence to filter predictions", default = 0.5)
-    parser.add_argument("--nms_thresh", dest = "nms_thresh", help = "NMS Threshhold", default = 0.4)
-    parser.add_argument("--cfg", dest = 'cfgfile', help = 
-                        "Config file",
-                        default = "cfg/yolov3.cfg", type = str)
-    parser.add_argument("--names", dest = 'names', help =
-                        "coco names file",
-                        default = "data/coco.names", type = str)
-    parser.add_argument("--weights", dest = 'weightsfile', help = 
-                        "weightsfile",
-                        default = "yolov3.weights", type = str)
-    parser.add_argument("--test_im", dest = 'test_im', help =
-                        "test_im",
-                        default = "dog-cycle-car.png", type = str)
-    parser.add_argument("--reso", dest = 'reso', help = 
-                        "Input resolution of the network. Increase to increase accuracy. Decrease to increase speed",
-                        default = "416", type = str)
-    parser.add_argument("--scales", dest = "scales", help = "Scales to use for detection",
-                        default = "1,2,3", type = str)
-    
-    return parser.parse_args()
+    fp = open(namesfile, "r")
+    names = fp.read().split("\n")[:-1]
+    return names
 
-if __name__ ==  '__main__':
-    args = arg_parse()
-    
-    scales = args.scales
-    
-    
-#        scales = [int(x) for x in scales.split(',')]
-#        
-#        
-#        
-#        args.reso = int(args.reso)
-#        
-#        num_boxes = [args.reso//32, args.reso//16, args.reso//8]    
-#        scale_indices = [3*(x**2) for x in num_boxes]
-#        scale_indices = list(itertools.accumulate(scale_indices, lambda x,y : x+y))
-#    
-#        
-#        li = []
-#        i = 0
-#        for scale in scale_indices:        
-#            li.extend(list(range(i, scale))) 
-#            i = scale
-#        
-#        scale_indices = li
 
-    images = args.images
-    batch_size = int(args.bs)
-    confidence = float(args.confidence)
-    nms_thesh = float(args.nms_thresh)
-    start = 0
+def letterbox_image(img, inp_dim):
+    """
+    Resize image with unchanged aspect ratio using padding
 
+    Args:
+        img:
+        inp_dim:
+
+    Returns:
+
+    """
+
+    img_w, img_h = img.shape[1], img.shape[0]
+    w, h = inp_dim
+    new_w = int(img_w * min(w / img_w, h / img_h))
+    new_h = int(img_h * min(w / img_w, h / img_h))
+    resized_image = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    canvas = np.full((inp_dim[1], inp_dim[0], 3), 128)
+    canvas[(h - new_h) // 2:(h - new_h) // 2 + new_h, (w - new_w) // 2:(w - new_w) // 2 + new_w, :] = resized_image
+
+    return canvas
+
+
+def prep_image(img, inp_dim):
+    """
+    Prepare image for inputting to the neural network
+
+    Args:
+        img:
+        inp_dim:
+
+    Returns:
+
+    """
+
+    orig_im = cv2.imread(img)
+    dim = orig_im.shape[1], orig_im.shape[0]
+    img = (letterbox_image(orig_im, (inp_dim, inp_dim)))
+    img_ = img[:, :, ::-1].transpose((2, 0, 1)).copy()
+    img_ = torch.from_numpy(img_).float().div(255.0).unsqueeze(0)
+    return img_, orig_im, dim
+
+
+def annotate_image(df, img, out_fid):
+    """
+
+    Args:
+        df:
+        img:
+        out_fid:
+
+    Returns:
+
+    """
+
+    # build list of colours (assume less than 4 classes!)
+    cols = [(255, 0, 0),  # red
+            (0, 255, 0),  # green
+            (0, 0, 255),  # blue
+            (255, 0, 255),  # fuchsia
+            (255, 255, 0),  # yellow
+            (0, 255, 255)]
+
+    # get all possible categories -> make colour list
+    unique_cats = list(set(df['cls']))
+    unique_cats.sort()
+    cat_cols = {u: cols[x] for x, u in enumerate(unique_cats)}
+
+    for _, row in df.iterrows():
+        geo = row.geometry
+        cv2.polylines(img, np.int32([geo.exterior.coords[:]]), True, cat_cols[row['cls']], thickness=8)
+        cv2.putText(img, row['cls'], (int(geo.bounds[0]), int(geo.bounds[1]) - 10), cv2.FONT_HERSHEY_PLAIN, 4,
+                    cat_cols[row['cls']], 3)
+    cv2.imwrite(out_fid, img)
+
+
+def rescale(im_dim_list, output, inp_dim):
+    """
+
+    Args:
+        im_dim_list:
+        output:
+        inp_dim:
+
+    Returns:
+
+    """
+
+    im_dim_list = torch.index_select(im_dim_list, 0, output[:, 0].long())
+    scaling_factor = torch.min(inp_dim / im_dim_list, 1)[0].view(-1, 1)
+    output[:, [1, 3]] -= (inp_dim - scaling_factor * im_dim_list[:, 0].view(-1, 1)) / 2
+    output[:, [2, 4]] -= (inp_dim - scaling_factor * im_dim_list[:, 1].view(-1, 1)) / 2
+    output[:, 1:5] /= scaling_factor
+
+    for i in range(output.shape[0]):
+        output[i, [1, 3]] = torch.clamp(output[i, [1, 3]], 0.0, im_dim_list[i, 0])
+        output[i, [2, 4]] = torch.clamp(output[i, [2, 4]], 0.0, im_dim_list[i, 1])
+
+    return output
+
+
+def convert_geometry(detections, input_im, classes, fid_out=None):
+    # convert detections to simple GeoDataFrame
+    df = []
+    fname = os.path.splitext(os.path.split(input_im)[-1])[0]
+    for detection in detections.tolist():
+        # extract required information (per detection)
+        tl = detection[1:3]
+        br = detection[3:5]
+        geo = box(*tl, *br)
+        cls = classes[int(detection[-1])]
+
+        # save into a GeoDataFrame
+        df.append(gpd.GeoSeries({'geometry': geo, 'src_img': fname, 'cls': cls}))
+
+    df = gpd.GeoDataFrame(df)
+
+    # save as a GeoJSON
+    if fid_out is not None:
+        if os.path.exists(fid_out):
+            os.remove(fid_out)
+        df.to_file(fid_out, driver='GeoJSON')
+
+    return df
+
+
+def yolo_detect(input_im, out_dir, cfg, names, weights, confidence, nms_thresh, resolution):
+    """
+
+    Args:
+        input_im:
+        out_dir:
+        confidence:
+        nms_thresh:
+        cfg:
+        names:
+        weights:
+        resolution:
+
+    Returns:
+
+    """
+
+    # check if GPU is available
     CUDA = torch.cuda.is_available()
 
-    num_classes = 80
-    classes = load_classes(args.names)
+    # load neural network + weights + classes
+    model = Darknet(cfg)
+    model.load_weights(weights)
+    classes = load_classes(names)
 
-    #Set up the neural network
-    print("Loading network.....")
-    model = Darknet(args.cfgfile)
-    model.load_weights(args.weightsfile)
-    print("Network successfully loaded")
-    
-    model.net_info["height"] = args.reso
+    # add resolution information to model object
+    model.net_info["height"] = resolution
     inp_dim = int(model.net_info["height"])
-    assert inp_dim % 32 == 0 
+    assert inp_dim % 32 == 0
     assert inp_dim > 32
 
-    #If there's a GPU availible, put the model on GPU
+    # put model on GPU (if available)
     if CUDA:
         model.cuda()
-    
-    
-    #Set the model in evaluation mode
+
+    # set model object to "evaluation mode"
     model.eval()
-    
-    read_dir = time.time()
-    #Detection phase
-    try:
-        imlist = [osp.join(osp.realpath('.'), images, img) for img in os.listdir(images) if os.path.splitext(img)[1] == '.png' or os.path.splitext(img)[1] =='.jpeg' or os.path.splitext(img)[1] =='.jpg']
-    except NotADirectoryError:
-        imlist = []
-        imlist.append(osp.join(osp.realpath('.'), images))
-    except FileNotFoundError:
-        print ("No file or directory with the name {}".format(images))
-        exit()
-        
-    if not os.path.exists(args.det):
-        os.makedirs(args.det)
-        
-    load_batch = time.time()
-    
-    batches = list(map(prep_image, imlist, [inp_dim for x in range(len(imlist))]))
-    im_batches = [x[0] for x in batches]
-    orig_ims = [x[1] for x in batches]
-    im_dim_list = [x[2] for x in batches]
-    im_dim_list = torch.FloatTensor(im_dim_list).repeat(1,2)
-    
-    
-    
+
+    # prepare image (into "batch")
+    batch, im_data, im_dim = prep_image(input_im, inp_dim)
+    im_dim = torch.FloatTensor(im_dim).repeat(1, 2)
+
+    # convert params to GPU (if available)
     if CUDA:
-        im_dim_list = im_dim_list.cuda()
-    
-    leftover = 0
-    
-    if (len(im_dim_list) % batch_size):
-        leftover = 1
-        
-        
-    if batch_size != 1:
-        num_batches = len(imlist) // batch_size + leftover            
-        im_batches = [torch.cat((im_batches[i*batch_size : min((i +  1)*batch_size,
-                            len(im_batches))]))  for i in range(num_batches)]        
+        im_dim = im_dim.cuda()
+        batch = batch.cuda()
 
+    # Apply offsets to the result predictions -> tranform the predictions as described in the YOLO paper
+    with torch.no_grad():
+        prediction = model(Variable(batch), CUDA)
 
-    i = 0
-    
+    # get the boxes with object confidence > threshold -> convert to absolute coordinates
+    detections = write_results(prediction, confidence, len(classes), nms=True, nms_conf=nms_thresh)
 
-    write = False
-    model(get_test_input(args.test_im, inp_dim, CUDA), CUDA)
-    
-    start_det_loop = time.time()
-    
-    objs = {}
-    
-    
-    
-    for batch in im_batches:
-        #load the image 
-        start = time.time()
-        if CUDA:
-            batch = batch.cuda()
-        
+    if CUDA:
+        torch.cuda.synchronize()
 
-        #Apply offsets to the result predictions
-        #Tranform the predictions as described in the YOLO paper
-        #flatten the prediction vector 
-        # B x (bbox cord x no. of anchors) x grid_w x grid_h --> B x bbox x (all the boxes) 
-        # Put every proposed box as a row.
-        with torch.no_grad():
-            prediction = model(Variable(batch), CUDA)
-        
-#        prediction = prediction[:,scale_indices]
+    # post-process detections -> json + annotated image
+    detections = rescale(im_dim, detections, inp_dim)  # rescale output
+    geo_fid = os.path.join(out_dir, '{}.geojson'.format(os.path.splitext(os.path.split(input_im)[-1])[0]))
+    df = convert_geometry(detections, input_im, classes, geo_fid)
+    annotated_fid = os.path.join(out_dir, os.path.split(input_im)[-1])
+    annotate_image(df, im_data, annotated_fid)
 
-        
-        #get the boxes with object confidence > threshold
-        #Convert the cordinates to absolute coordinates
-        #perform NMS on these boxes, and save the results 
-        #I could have done NMS and saving seperately to have a better abstraction
-        #But both these operations require looping, hence 
-        #clubbing these ops in one loop instead of two. 
-        #loops are slower than vectorised operations. 
-        
-        prediction = write_results(prediction, confidence, num_classes, nms = True, nms_conf = nms_thesh)
-        
-        
-        if type(prediction) == int:
-            i += 1
-            continue
-
-        end = time.time()
-        
-                    
-#        print(end - start)
-
-            
-
-        prediction[:,0] += i*batch_size
-        
-    
-            
-          
-        if not write:
-            output = prediction
-            write = 1
-        else:
-            output = torch.cat((output,prediction))
-            
-        
-        
-
-        for im_num, image in enumerate(imlist[i*batch_size: min((i +  1)*batch_size, len(imlist))]):
-            im_id = i*batch_size + im_num
-            objs = [classes[int(x[-1])] for x in output if int(x[0]) == im_id]
-            print("{0:20s} predicted in {1:6.3f} seconds".format(image.split("/")[-1], (end - start)/batch_size))
-            print("{0:20s} {1:s}".format("Objects Detected:", " ".join(objs)))
-            print("----------------------------------------------------------")
-        i += 1
-
-        
-        if CUDA:
-            torch.cuda.synchronize()
-    
-    try:
-        output
-    except NameError:
-        print("No detections were made")
-        exit()
-        
-    im_dim_list = torch.index_select(im_dim_list, 0, output[:,0].long())
-    
-    scaling_factor = torch.min(inp_dim/im_dim_list,1)[0].view(-1,1)
-    
-    
-    output[:,[1,3]] -= (inp_dim - scaling_factor*im_dim_list[:,0].view(-1,1))/2
-    output[:,[2,4]] -= (inp_dim - scaling_factor*im_dim_list[:,1].view(-1,1))/2
-    
-    
-    
-    output[:,1:5] /= scaling_factor
-    
-    for i in range(output.shape[0]):
-        output[i, [1,3]] = torch.clamp(output[i, [1,3]], 0.0, im_dim_list[i,0])
-        output[i, [2,4]] = torch.clamp(output[i, [2,4]], 0.0, im_dim_list[i,1])
-        
-        
-    output_recast = time.time()
-    
-    
-    class_load = time.time()
-
-    # colors = pkl.load(open("pallete", "rb"))
-    
-    
-    draw = time.time()
-
-
-    def write(x, results):
-        c1 = tuple(x[1:3].int())
-        c2 = tuple(x[3:5].int())
-        img = results[int(x[0])]
-        cls = int(x[-1])
-        label = "{0}".format(classes[cls])
-        # color = random.choice(colors)
-        cv2.rectangle(img, c1, c2, [255, 0, 0], 10)
-        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 5 , 5)[0]
-        c2 = c1[0] + t_size[0] + 3, c1[1] + t_size[1] + 4
-        cv2.rectangle(img, c1, c2, [255, 0, 0], -1)
-        cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 5, [225,255,255], 5)
-        return img
-    
-            
-    list(map(lambda x: write(x, orig_ims), output))
-      
-    det_names = pd.Series(imlist).apply(lambda x: "{}/{}".format(args.det,x.split("/")[-1]))
-    
-    list(map(cv2.imwrite, det_names, orig_ims))
-    
-    end = time.time()
-    
-    print()
-    print("SUMMARY")
-    print("----------------------------------------------------------")
-    print("{:25s}: {}".format("Task", "Time Taken (in seconds)"))
-    print()
-    print("{:25s}: {:2.3f}".format("Reading addresses", load_batch - read_dir))
-    print("{:25s}: {:2.3f}".format("Loading batch", start_det_loop - load_batch))
-    print("{:25s}: {:2.3f}".format("Detection (" + str(len(imlist)) +  " images)", output_recast - start_det_loop))
-    print("{:25s}: {:2.3f}".format("Output Processing", class_load - output_recast))
-    print("{:25s}: {:2.3f}".format("Drawing Boxes", end - draw))
-    print("{:25s}: {:2.3f}".format("Average time_per_img", (end - load_batch)/len(imlist)))
-    print("----------------------------------------------------------")
-
-    
     torch.cuda.empty_cache()
-    
-    
-        
-        
-    
-    
+
+
+@click.command()
+@click.argument('input_im', type=click.Path(exists=True, dir_okay=False))
+@click.argument('out_dir', type=click.Path(exists=False, dir_okay=True))
+@click.argument('cfg', type=click.Path(exists=True, dir_okay=False))
+@click.argument('names', type=click.Path(exists=True, dir_okay=False))
+@click.argument('weights', type=click.Path(exists=True, dir_okay=False))
+@click.option('--confidence', type=float, default=0.5, help="minimum object confidence for filtering predictions")
+@click.option('--nms_thresh', type=float, default=0.2, help="non-maximum suppression for filtering predictions")
+@click.option('--resolution', type=int, default=416,
+              help="input resolution of the network (balance accuracy and speed)")
+def main(input_im, out_dir, cfg, names, weights, confidence, nms_thresh, resolution):
+    yolo_detect(input_im, out_dir, cfg, names, weights, confidence, nms_thresh, resolution)
+
+
+if __name__ == '__main__':
+    main()
